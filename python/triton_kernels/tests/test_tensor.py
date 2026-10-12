@@ -53,6 +53,7 @@ _STRIDED_DTYPES = [
     torch.bfloat16,
     torch.float16,
     torch.uint8,
+    torch.int8,
     torch.int32,
 ]
 
@@ -364,7 +365,7 @@ def test_convert_layout_between_strided_layouts_peak_allocation(dtype, with_out)
     out = empty(shape, dtype=dtype, device=source.device, layout=destination) if with_out else None
     warm = convert_layout(source, destination, out=out)
     if with_out:
-        out.data.fill_(0xAB)
+        out.data.fill_(-85 if out.data.dtype == torch.int8 else 0xAB)
     torch.cuda.synchronize(source.device)
     del warm
     baseline = torch.cuda.memory_allocated(source.device)

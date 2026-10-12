@@ -24,6 +24,7 @@ from triton_kernels.numerics_details.mxfp import upcast_from_mxfp, quantize_mxfp
 from triton_kernels.testing import assert_close, make_random_tensor
 # target-specific utilities
 from triton_kernels.target_info import is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_gfx1250
+from triton_kernels.target_info import get_rdna_version as triton_kernels_rdna_version
 from triton_kernels.swiglu import swiglu, swiglu_fn
 from triton_kernels.swiglu import PrecisionConfig as SwiGLUPrecisionConfig
 from triton_kernels.tensor_details import layout
@@ -767,6 +768,89 @@ def test_matmul_mixed_fp8_resource_limits(shape, fp8_lhs, constraints, device, o
 
     expected = torch.matmul(a.float(), b.float()).to(torch.bfloat16)
     assert_close(expected, actual)
+
+
+@pytest.mark.parametrize("shape", [(128, 256, 128), (65, 79, 47), (1, 33, 257), (0, 7, 5), (7, 0, 5), (7, 5, 0)])
+@pytest.mark.parametrize("transpose_a, transpose_b", [(False, False), (False, True), (True, False), (True, True)])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_matmul_int8_rdna4(shape, transpose_a, transpose_b, wrapped, device, opt_flags_scope):
+    if triton_kernels_rdna_version() != 4:
+        pytest.skip("INT8 matmul requires AMD RDNA4")
+    m, n, k = shape
+    torch.manual_seed(0)
+    a = torch.randint(-128, 128, (k, m) if transpose_a else (m, k), dtype=torch.int8, device=device)
+    b = torch.randint(-128, 128, (n, k) if transpose_b else (k, n), dtype=torch.int8, device=device)
+    a = a.T if transpose_a else a
+    b = b.T if transpose_b else b
+    expected = (a.cpu().long() @ b.cpu().long()).to(device=device, dtype=torch.int32)
+    lhs, rhs = (wrap_torch_tensor(a), wrap_torch_tensor(b)) if wrapped else (a, b)
+    config = PrecisionConfig()
+    actual = matmul(lhs, rhs, None, precision_config=config)
+    assert actual.dtype == torch.int32
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert config.out_dtype is None and config.intermediate_out_dtype is None
+    supplied_output = torch.empty_like(actual)
+    actual = matmul(lhs, rhs, None, c=supplied_output, precision_config=PrecisionConfig(out_dtype=torch.int32))
+    assert actual.data_ptr() == supplied_output.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    reference = matmul_torch(a, b, None, precision_config=PrecisionConfig(out_dtype=torch.int32))
+    torch.testing.assert_close(reference, expected, rtol=0, atol=0)
+
+
+def test_matmul_int8_rdna4_accumulator_precision(device, opt_flags_scope):
+    if triton_kernels_rdna_version() != 4:
+        pytest.skip("INT8 matmul requires AMD RDNA4")
+    # 127**2 * 1041 is odd and exceeds 2**24: an FP32 epilogue loses one bit.
+    a = torch.full((1, 1041), 127, dtype=torch.int8, device=device)
+    b = torch.full((1041, 1), 127, dtype=torch.int8, device=device)
+    actual = matmul(a, b, None)
+    assert actual.dtype == torch.int32
+    assert actual.item() == 127**2 * 1041
+
+
+@pytest.mark.parametrize("case", ["mixed", "output", "intermediate", "buffer", "bias", "scale", "batched", "split_k", "persistent"])
+def test_matmul_int8_rdna4_rejects_unsupported(case, device, opt_flags_scope):
+    if triton_kernels_rdna_version() != 4:
+        pytest.skip("INT8 matmul requires AMD RDNA4")
+    a = torch.ones((16, 32), dtype=torch.int8, device=device)
+    b = torch.ones((32, 16), dtype=torch.int8, device=device)
+    kwargs = {}
+    bias = None
+    error = NotImplementedError
+    if case == "mixed":
+        b = b.float()
+        error, message = ValueError, "both operands"
+    elif case == "output":
+        kwargs["precision_config"] = PrecisionConfig(out_dtype=torch.float32)
+        error, message = ValueError, "torch.int32 output"
+    elif case == "intermediate":
+        kwargs["precision_config"] = PrecisionConfig(intermediate_out_dtype=torch.float32)
+        error, message = ValueError, "torch.int32 intermediate"
+    elif case == "buffer":
+        kwargs["c"] = torch.empty((16, 16), device=device)
+        error, message = ValueError, "output buffer"
+    elif case == "bias":
+        bias = torch.ones((16,), device=device)
+        message = "fused or ragged"
+    elif case == "scale":
+        kwargs["precision_config"] = PrecisionConfig(a_mx_scale=torch.ones((16, 1), device=device))
+        message = "scaling or quantization"
+    elif case == "batched":
+        a, b = a.unsqueeze(0), b.unsqueeze(0)
+        message = "plain 2D"
+    else:
+        opt_flags.update_opt_flags_constraints({"split_k": 2} if case == "split_k" else {"is_persistent": True})
+        error, message = opt_flags.InapplicableConstraint, "cannot enforce"
+    with pytest.raises(error, match=message):
+        matmul(a, b, bias, **kwargs)
+
+
+def test_matmul_int8_rejects_unsupported_target(device, monkeypatch):
+    monkeypatch.setattr("triton_kernels.matmul.target_info.get_rdna_version", lambda: -1)
+    a = torch.ones((16, 32), dtype=torch.int8, device=device)
+    b = torch.ones((32, 16), dtype=torch.int8, device=device)
+    with pytest.raises(NotImplementedError, match="AMD RDNA4"):
+        matmul(a, b, None)
 
 
 @pytest.mark.parametrize("fp8_lhs", [False, True])

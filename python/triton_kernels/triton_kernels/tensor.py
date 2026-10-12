@@ -11,7 +11,7 @@ from .tensor_details import ragged_tensor as ragged_tensor_details
 from .tensor_details.layout import BlackwellMXValueLayout, Layout, StridedLayout, TiledLayout
 from .tensor_details.ragged_tensor import RaggedTensorMetadata
 from .tensor_details.dtype import IntegerType, FloatType, DataType
-from .tensor_details.dtype import FP4, UINT8, FP8_E4M3FN, FP8_E4M3FNUZ, FP8_E5M2, FP16, BF16, FP32, FP64, INT16, INT32, INT64
+from .tensor_details.dtype import FP4, UINT8, INT8, FP8_E4M3FN, FP8_E4M3FNUZ, FP8_E5M2, FP16, BF16, FP32, FP64, INT16, INT32, INT64
 
 
 # storage
@@ -327,6 +327,7 @@ def dtype_to_torch_dtype(dtype: DataType) -> torch.dtype:
     return {
         FP4: torch.uint8,
         UINT8: torch.uint8,
+        INT8: torch.int8,
         FP8_E4M3FN: torch.float8_e4m3fn,
         FP8_E4M3FNUZ: torch.float8_e4m3fnuz,
         FP8_E5M2: torch.float8_e5m2,
@@ -346,6 +347,7 @@ def torch_dtype_to_dtype(dtype: torch.dtype) -> DataType:
     id = str(dtype).split(".")[-1]
     vals = {
         "uint8": UINT8,
+        "int8": INT8,
         "float8_e4m3fn": FP8_E4M3FN,
         "float8_e4m3fnuz": FP8_E4M3FNUZ,
         "float8_e5m2": FP8_E5M2,

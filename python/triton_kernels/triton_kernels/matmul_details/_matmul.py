@@ -128,6 +128,7 @@ def _matmul(
 
     x_type: tl.constexpr = X.dtype.element_ty
     w_type: tl.constexpr = W.dtype.element_ty
+    is_int_dot: tl.constexpr = x_type == tl.int8 and w_type == tl.int8
     is_x_microscaled: tl.constexpr = XMxScale is not None
     is_w_microscaled: tl.constexpr = WMxScale is not None
     has_x_tensor_scale: tl.constexpr = XTensorScale is not None
@@ -379,7 +380,9 @@ def _matmul(
     else:
         WTensorScalePtrs = None
     # compute output
-    acc_dtype: tl.constexpr = tl.float64 if x_type == tl.float64 and w_type == tl.float64 else tl.float32
+    acc_dtype: tl.constexpr = (
+        tl.int32 if is_int_dot else tl.float64 if x_type == tl.float64 and w_type == tl.float64 else tl.float32
+    )
     acc = tl.zeros((BLOCK_N, BLOCK_M) if SWAP_XW else (BLOCK_M, BLOCK_N), dtype=acc_dtype)
     x_k_limit = K_X + BLOCK_K * SPLIT_K
     w_k_limit = K_W + PACKED_BLOCK_K_W * SPLIT_K
@@ -518,43 +521,50 @@ def _matmul(
     offs_y_n = BLOCK_N * pid_n + tl.arange(0, BLOCK_N)
     mask_m = offs_m < eM
     mask_n = offs_y_n < N
-    if B is not None:
-        BPtrs = B + expt_id * stride_b_e + offs_y_n
-        if pid_k == 0:
-            bias = tl.load(BPtrs, mask=mask_n, other=0)
-        else:
-            bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
-    else:
-        bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
-    if Betas is not None:
-        betas = tl.load(Betas + start_m + offs_m, mask=mask_m, other=0.0)
-    else:
-        betas = tl.full([BLOCK_M], 1, dtype=tl.float32)
-    if Gammas is not None:
-        gammas = tl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
-    else:
-        gammas = tl.full([BLOCK_M], 1, dtype=tl.float32)
-    # flexpoint
-    x_scale = load_scale(XScale)
-    if PER_BATCH_W_SCALE:
-        w_scale = load_scale(WScale + expt_id)
-    else:
-        w_scale = load_scale(WScale)
     if SWAP_XW:
         acc = acc.trans()
-    acc *= x_scale * w_scale
-    acc = tl.fma(bias[None, :], betas[:, None], acc)
-    if out_alpha is not None:
-        acc *= out_alpha
-    if ACTIVATION_FN is not None:
-        out = ACTIVATION_FN(acc, *activation_fn_args)
-        tl.static_assert(out.shape[1] == OUT_BLOCK_N, f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})")
-        offs_y_n = OUT_BLOCK_N * pid_n + tl.arange(0, OUT_BLOCK_N)
-        mask_n = offs_y_n < yN
-    else:
-        tl.static_assert(ACTIVATION_REDUCTION_N == 1, "Activation reduction must be 1 if no activation fn is provided")
+    if is_int_dot:
+        tl.static_assert(B is None and Betas is None and Gammas is None and out_alpha is None)
+        tl.static_assert(XScale is None and WScale is None and OutAcc is None)
+        tl.static_assert(ACTIVATION_FN is None and EPILOGUE_FN is None)
+        tl.static_assert(YExpectedScale is None and YActualScale is None and YChecksumScale is None)
         out = acc
-    out *= gammas[:, None]
+    else:
+        if B is not None:
+            BPtrs = B + expt_id * stride_b_e + offs_y_n
+            if pid_k == 0:
+                bias = tl.load(BPtrs, mask=mask_n, other=0)
+            else:
+                bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
+        else:
+            bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
+        if Betas is not None:
+            betas = tl.load(Betas + start_m + offs_m, mask=mask_m, other=0.0)
+        else:
+            betas = tl.full([BLOCK_M], 1, dtype=tl.float32)
+        if Gammas is not None:
+            gammas = tl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
+        else:
+            gammas = tl.full([BLOCK_M], 1, dtype=tl.float32)
+        # flexpoint
+        x_scale = load_scale(XScale)
+        if PER_BATCH_W_SCALE:
+            w_scale = load_scale(WScale + expt_id)
+        else:
+            w_scale = load_scale(WScale)
+        acc *= x_scale * w_scale
+        acc = tl.fma(bias[None, :], betas[:, None], acc)
+        if out_alpha is not None:
+            acc *= out_alpha
+        if ACTIVATION_FN is not None:
+            out = ACTIVATION_FN(acc, *activation_fn_args)
+            tl.static_assert(out.shape[1] == OUT_BLOCK_N, f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})")
+            offs_y_n = OUT_BLOCK_N * pid_n + tl.arange(0, OUT_BLOCK_N)
+            mask_n = offs_y_n < yN
+        else:
+            tl.static_assert(ACTIVATION_REDUCTION_N == 1, "Activation reduction must be 1 if no activation fn is provided")
+            out = acc
+        out *= gammas[:, None]
     # write-back
     Y += start_z_out.to(index_type) * stride_y_z
     if WriteBackIndx is not None:
@@ -634,12 +644,13 @@ def _matmul(
         scale_store_mask = mask_m[:, None] if OUT_N_TILE_ALIGNED else mask_m[:, None] & mask_n_scale[None, :]
         tl.store(YActualScalePtrs, out_scale, mask=scale_store_mask)
     else:
-        if PER_BATCH_OUT_SCALE:
-            YExpectedScale = YExpectedScale + start_z_out
-            YActualScale = YActualScale + start_z_out
-        out = float_to_flex(out, YExpectedScale, YActualScale, YChecksumScale, mask, Y, FLEXPOINT_SATURATE_INF)
-        if EPILOGUE_FN is not None and not IS_EPILOGUE_QUANT_MX:
-            out = EPILOGUE_FN(out, *epilogue_fn_args, target_dtype=YPtrs.dtype.element_ty)
+        if not is_int_dot:
+            if PER_BATCH_OUT_SCALE:
+                YExpectedScale = YExpectedScale + start_z_out
+                YActualScale = YActualScale + start_z_out
+            out = float_to_flex(out, YExpectedScale, YActualScale, YChecksumScale, mask, Y, FLEXPOINT_SATURATE_INF)
+            if EPILOGUE_FN is not None and not IS_EPILOGUE_QUANT_MX:
+                out = EPILOGUE_FN(out, *epilogue_fn_args, target_dtype=YPtrs.dtype.element_ty)
     if pYPtrs is None:
         tl.store(YPtrs, out, mask=mask_store)
     else:

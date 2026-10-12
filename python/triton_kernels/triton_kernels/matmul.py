@@ -32,7 +32,7 @@ from .matmul_details.opt_flags import (
 )
 from .matmul_details.opt_flags_details import opt_flags_nvidia
 from .specialize import FnSpecs, SpecializationModule, ClosureArg
-from .tensor import Storage, Tensor, UINT8, FP4, FP8_E4M3FN, FP64, wrap_torch_tensor, RaggedTensorMetadata, is_tma_compliant, make_tma, convert_layout
+from .tensor import Storage, Tensor, UINT8, INT8, FP4, FP8_E4M3FN, FP64, wrap_torch_tensor, RaggedTensorMetadata, is_tma_compliant, make_tma, convert_layout
 from .tensor import dtype_to_torch_dtype, torch_dtype_to_dtype
 from .reduce import reduce
 from .reduce import PostprocessFn as ReducePostprocessFn
@@ -275,6 +275,9 @@ def matmul(a, b, bias,
     matmul kernel for MXFP4 weights. This can add rounding error.
     That path defaults to BF16 output unless out_dtype or c is supplied.
 
+    On AMD RDNA4, plain 2D signed INT8 inputs use INT32 accumulation and output.
+    This path does not support split-K, persistent kernels, scaling, or fusion.
+
     matmul can be optionally fused with all gather or scatter at the end for the output. When fused_comm is specified, the m-th row of the output will be stored to (m * n_reduce_shards + reduce_rank) -th row
     of each rank id in range [scatter_shard_indx[m] * n_reduce_shards, (scatter_shard_indx[m] + 1) * n_reduce_shards) if scatter_shard_indx is not None, otherwise the output will be all gathered across all reduce ranks.
     When scatter_shard_indx is specified, the caller should ensure that the indices of different shards do not conflict.
@@ -299,6 +302,63 @@ def matmul(a, b, bias,
     # canonicalize inputs
     if precision_config is None:
         precision_config = PrecisionConfig()
+    a_is_int8 = a.dtype == torch.int8 or a.dtype == INT8
+    b_is_int8 = b.dtype == torch.int8 or b.dtype == INT8
+    is_int8 = a_is_int8 or b_is_int8
+    if is_int8:
+        if not (a_is_int8 and b_is_int8):
+            raise ValueError("INT8 matmul requires both operands to use torch.int8")
+        if target_info.get_rdna_version() != 4:
+            raise NotImplementedError("INT8 matmul is currently supported only on AMD RDNA4 targets")
+        if a.ndim != 2 or b.ndim != 2:
+            raise NotImplementedError("INT8 matmul currently supports only plain 2D inputs")
+        unsupported = {
+            "bias": bias,
+            "a_ragged_metadata": a_ragged_metadata,
+            "b_ragged_metadata": b_ragged_metadata,
+            "gather_indx": gather_indx,
+            "scatter_indx": scatter_indx,
+            "betas": betas,
+            "gammas": gammas,
+            "out_alpha": out_alpha,
+            "fused_comm": fused_comm,
+            "fused_activation": fused_activation,
+            "epilogue": epilogue,
+            "c_acc_in": c_acc_in,
+        }
+        unsupported = [name for name, value in unsupported.items() if value is not None]
+        if unsupported:
+            raise NotImplementedError(
+                "INT8 matmul does not support fused or ragged arguments: " + ", ".join(unsupported)
+            )
+        if c is not None and c.dtype != torch.int32:
+            raise ValueError("INT8 matmul output buffer must use torch.int32")
+        has_scales = any(
+            value is not None for value in (
+                precision_config.flex_ctx.lhs_data.dtype,
+                precision_config.flex_ctx.lhs_data.scale,
+                precision_config.flex_ctx.rhs_data.dtype,
+                precision_config.flex_ctx.rhs_data.scale,
+                precision_config.flex_ctx.out_data.dtype,
+                precision_config.flex_ctx.out_data.expected_scale,
+                precision_config.flex_ctx.out_data.actual_scale,
+                precision_config.flex_ctx.out_data.checksum_scale,
+                precision_config.flex_ctx.acc_data.dtype,
+                precision_config.flex_ctx.acc_data.scale,
+                precision_config.a_mx_scale,
+                precision_config.a_mx_tensor_scale,
+                precision_config.b_mx_scale,
+                precision_config.b_mx_tensor_scale,
+                precision_config.c_mx_scale,
+            )
+        )
+        if has_scales:
+            raise NotImplementedError("INT8 matmul does not support scaling or quantization")
+        if precision_config.out_dtype not in (None, torch.int32):
+            raise ValueError("INT8 matmul requires torch.int32 output")
+        if precision_config.intermediate_out_dtype not in (None, torch.int32):
+            raise ValueError("INT8 matmul requires torch.int32 intermediate output")
+        precision_config = replace(precision_config, out_dtype=torch.int32, intermediate_out_dtype=torch.int32)
     if fused_activation is None:
         fused_activation = FusedActivation(FnSpecs.default(), tuple())
     if epilogue is None:
@@ -444,7 +504,8 @@ def matmul(a, b, bias,
         can_use_tma = False
     has_gather_tma = has_gather and a.dtype.bitwidth <= 32 and target_info.has_tma_gather()
     is_ragged_mx = (a_has_mx or b_has_mx) and (is_a_ragged or is_b_ragged)
-    can_use_split_k = scatter_indx is None and not is_ragged_mx and ragged_dimension != "K" and c_acc_in is None and precision_config.c_mx_scale is None
+    can_use_split_k = (not is_int8 and scatter_indx is None and not is_ragged_mx and ragged_dimension != "K"
+                       and c_acc_in is None and precision_config.c_mx_scale is None)
     block_k = None
     if ragged_dimension == "K":
         block_k = a_ragged_metadata.slice_sizes_divisibility or b_ragged_metadata.slice_sizes_divisibility
@@ -465,6 +526,8 @@ def matmul(a, b, bias,
         rhs_layout=b.storage.layout,
         epilogue_reduction_n=fused_activation.specs.reduction_n,
     )
+    if is_int8 and (opt_flags.split_k != 1 or opt_flags.is_persistent):
+        raise NotImplementedError("INT8 matmul requires split_k=1 and a non-persistent kernel")
     if any(isinstance(t.storage.layout, TiledLayout) for t in (a, b)):
         if not opt_flags.is_persistent or not can_use_tma or ragged_dimension != "K":
             raise InapplicableConstraint("Tiled operands require a persistent ragged-K TMA matmul")
@@ -929,8 +992,10 @@ def matmul_torch(a, b, bias,
         return scale(out, precision_config.flex_ctx.out_data.expected_scale)
 
     is_input_batched = a.ndim == 3
-    assert a.dtype.itemsize > 1
-    assert b.dtype.itemsize > 1
+    is_int8 = a.dtype == b.dtype == torch.int8
+    if (a.dtype == torch.int8 or b.dtype == torch.int8) and not is_int8:
+        raise ValueError("INT8 matmul requires both operands to use torch.int8")
+    assert is_int8 or (a.dtype.itemsize > 1 and b.dtype.itemsize > 1)
     if is_input_batched:
         assert gather_indx is None, "gather not supported in batched mode"
         assert scatter_indx is None, "scatter not supported in batched mode"
@@ -954,17 +1019,24 @@ def matmul_torch(a, b, bias,
     else:
         offs = [[0, a.shape[1]] for _ in range(b.shape[0])]
     # compute
-    compute_dtype = torch.float64 if a.dtype == b.dtype == torch.float64 else torch.float32
+    compute_dtype = torch.int32 if is_int8 else torch.float64 if a.dtype == b.dtype == torch.float64 else torch.float32
     n_rows = a.shape[1] if gather_indx is None else gather_indx.shape[0]
-    y = torch.zeros((a.shape[0], n_rows, b.shape[-1]), device=a.device, dtype=a.dtype)
+    output_dtype = torch.int32 if is_int8 else a.dtype
+    y = torch.zeros((a.shape[0], n_rows, b.shape[-1]), device=a.device, dtype=output_dtype)
     for i, (lo, hi) in enumerate(offs):
         if gather_indx is None:
             idx = torch.arange(lo, hi, device=a.device)
         else:
             idx = gather_indx[lo:hi]
         batch = i if is_input_batched else 0
-        out = torch.matmul(round_x(a[batch, idx, :], torch.arange(lo, hi, device="cuda")).to(compute_dtype),
-                           b[i].to(compute_dtype))
+        lhs = round_x(a[batch, idx, :], torch.arange(lo, hi, device="cuda")).to(compute_dtype)
+        rhs = b[i].to(compute_dtype)
+        if is_int8:
+            # PyTorch does not implement CUDA/HIP INT32 matmul. This is a correctness reference,
+            # so compute it exactly on the CPU and copy the result back to the input device.
+            out = torch.matmul(lhs.cpu(), rhs.cpu()).to(a.device)
+        else:
+            out = torch.matmul(lhs, rhs)
         if bias is not None:
             out += bias[i, :] if betas is None else bias[i, :] * betas[lo:hi, None]
         if gammas is not None:

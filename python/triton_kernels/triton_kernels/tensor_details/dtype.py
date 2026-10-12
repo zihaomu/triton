@@ -24,6 +24,7 @@ class FloatType:
 
 BIT = IntegerType(1, is_signed=False)
 UINT8 = IntegerType(8, is_signed=False)
+INT8 = IntegerType(8, is_signed=True)
 FP4 = FloatType(bitwidth_exponent=2, bitwidth_mantissa=1, is_signed=True)
 FP8_E4M3FN = FloatType(bitwidth_exponent=4, bitwidth_mantissa=3, is_signed=True)
 FP8_E4M3FNUZ = FloatType(bitwidth_exponent=4, bitwidth_mantissa=3, is_signed=True, unsigned_zero=True)
