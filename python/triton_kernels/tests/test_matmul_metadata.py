@@ -1,11 +1,70 @@
+import importlib.util
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
-
-from triton_kernels.matmul_details._common import _matmul_flops_and_bytes_from_slices, matmul_launch_metadata
-from triton_kernels.matmul_details._common import make_matmul_repr
+import triton
+from triton_kernels.matmul import PrecisionConfig, matmul, scoped_opt_flags_constraints
+from triton_kernels.matmul_details._common import (
+    _matmul_flops_and_bytes_from_slices,
+    make_matmul_repr,
+    matmul_launch_metadata,
+)
 from triton_kernels.proton_opts import launch_metadata_allow_sync, set_launch_metadata_allow_sync
+
+
+@pytest.fixture
+def dense_matmul_bench():
+    path = Path(__file__).parents[1] / "bench" / "bench_dense_matmul.py"
+    spec = importlib.util.spec_from_file_location("bench_dense_matmul", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_dense_matmul_kernel_lookup_device_function(dense_matmul_bench, monkeypatch):
+    name = "_matmul_NNN_i32xi8xi8_64x256x128x1"
+    other_device = SimpleNamespace(name=name, function=2)
+    old = SimpleNamespace(name=name, function=1)
+    current = SimpleNamespace(name=name, function=2)
+    unloaded = SimpleNamespace(name=name)
+    module = SimpleNamespace(
+        _matmul=SimpleNamespace(device_caches={
+            0: ({"other": other_device}, ),
+            1: ({"unloaded": unloaded, "old": old, "current": current}, ),
+        }),
+        _p_matmul=SimpleNamespace(device_caches={}),
+    )
+    monkeypatch.setattr(dense_matmul_bench, "specializations", SimpleNamespace(get=lambda: module))
+
+    assert dense_matmul_bench.find_compiled_kernel(name, 2, 1) is current
+    with pytest.raises(RuntimeError, match="was not found"):
+        dense_matmul_bench.find_compiled_kernel(name, 3, 1)
+
+
+@pytest.mark.parametrize("transpose_w", [False, True])
+def test_dense_matmul_launch_same_name_specializations(dense_matmul_bench, transpose_w, device):
+    kernels = []
+    with scoped_opt_flags_constraints(
+        {"block_m": 64, "block_n": 128, "block_k": 64, "num_warps": 4, "split_k": 1, "is_persistent": False}):
+        for m, n, k in [(128, 256, 128), (129, 257, 127), (128, 256, 128)]:
+            a = torch.randn((m, k), dtype=torch.float16, device=device)
+            b = torch.randn((n, k) if transpose_w else (k, n), dtype=torch.float16, device=device)
+            b = b.mT if transpose_w else b
+            actual, compiled = dense_matmul_bench.capture_main_launch(
+                lambda a=a, b=b: matmul(a, b, None, precision_config=PrecisionConfig(out_dtype=torch.float32)))
+            torch.testing.assert_close(actual, a.float() @ b.float(), rtol=1e-3, atol=1e-4)
+            even_k_key = (compiled.src.fn.arg_names.index("EVEN_K"), )
+            assert compiled.src.constants[even_k_key] == (k % 64 == 0)
+            assert dense_matmul_bench.find_compiled_kernel(
+                compiled.name, compiled.function, triton.runtime.driver.active.get_current_device()) is compiled
+            kernels.append(compiled)
+
+    assert kernels[0].name == kernels[1].name
+    assert kernels[0].hash != kernels[1].hash
+    assert kernels[0].function != kernels[1].function
+    assert kernels[2] is kernels[0]
 
 
 class _Kernel:
